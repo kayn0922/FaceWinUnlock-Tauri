@@ -158,11 +158,25 @@ const startDeployment = () => {
   riskDialogVisible.value = true;
 };
 
+const matchLockedCamera = (cameraList: any[], rawLock: string) => {
+  const text = (rawLock || '').trim();
+  if (!text || text === 'null' || text === '{}') { return null; }
+  let lock: any = null;
+  try { lock = JSON.parse(text); } catch (e) { lock = { device_id: text, camera_name: '' }; }
+  if (typeof lock === 'string') { lock = { device_id: lock, camera_name: '' }; }
+  const lockedId = String(lock?.device_id || '').toLowerCase();
+  if (lockedId) { return cameraList.find((item: any) => String(item.device_id || '').toLowerCase() === lockedId) || null; }
+  const lockedName = String(lock?.camera_name || '');
+  return lockedName ? (cameraList.find((item: any) => item.camera_name === lockedName) || null) : null;
+};
+
 const detectAndSaveCamera = async () => {
   try {
     const result: any = await invoke("get_camera");
     const cameraList = Array.isArray(result.data) ? result.data : [];
-    const firstValid = cameraList.find((item: any) => item.is_valid) || cameraList[0];
+    // 已锁定采集设备时以锁定设备为准，避免初始化流程把默认设备改回列表里的第一个
+    const locked = matchLockedCamera(cameraList, optionsStore.getOptionValueByKey('cameraLock'));
+    const firstValid = locked || cameraList.find((item: any) => item.is_valid) || cameraList[0];
     await optionsStore.saveOptions({ cameraList: JSON.stringify(cameraList), camera: firstValid ? firstValid.capture_index : "-1" });
     if (firstValid) { checks.camera = true; checks.camera_msg = ''; info(`初始化部署已自动选择摄像头: ${firstValid.camera_name}`); }
     else { checks.camera = false; checks.camera_msg = '未检测到可用摄像头'; }

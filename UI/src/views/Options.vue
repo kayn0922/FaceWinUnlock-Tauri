@@ -7,6 +7,7 @@
 		VideoCamera,
 		InfoFilled,
 		Refresh,
+		Lock,
 		Tools
 	} from '@element-plus/icons-vue'
 	import { useOptionsStore } from '../stores/options'
@@ -34,8 +35,29 @@
 	const activeNames = ref([]);
 	// 解锁服务是否打开了？
 	const isServiceRunning = ref(false);
+	// 采集设备锁定记录：{ device_id, camera_name }
+	// device_id 是 Media Foundation 设备 symbolic link，与枚举顺序无关，插拔/增减摄像头后仍指向同一台物理设备。
+	const parseCameraLock = (raw) => {
+		const text = (raw || '').trim();
+		if (!text || text === 'null' || text === '{}') { return null; }
+		try {
+			const value = JSON.parse(text);
+			if (value && typeof value === 'object') {
+				const device_id = typeof value.device_id === 'string' ? value.device_id.trim() : '';
+				const camera_name = typeof value.camera_name === 'string' ? value.camera_name.trim() : '';
+				return (device_id || camera_name) ? { device_id, camera_name } : null;
+			}
+			if (typeof value === 'string' && value.trim()) { return { device_id: value.trim(), camera_name: '' }; }
+		} catch (e) {
+			// 兼容早期写入的纯设备路径字符串
+			return { device_id: text, camera_name: '' };
+		}
+		return null;
+	};
+
 	const config = reactive({
 		camera: optionsStore.getOptionValueByKey('camera') || "-1",
+		cameraLock: parseCameraLock(optionsStore.getOptionValueByKey('cameraLock')),
 		cameraRotation: parseInt(optionsStore.getOptionValueByKey('cameraRotation')) || 0,
 		unlockBrightness: parseInt(optionsStore.getOptionValueByKey('unlockBrightness')) || 0,
 		autoStart: true,
@@ -244,6 +266,30 @@
 		});
 	});
 
+	// 枚举项与锁定记录是否指向同一台设备（优先设备路径；旧记录只有设备名时回落名称匹配）
+	const isSameCameraLock = (item, lock) => {
+		if (!item || !lock) { return false; }
+		const lockedId = String(lock.device_id || '').toLowerCase();
+		const itemId = String(item.device_id || '').toLowerCase();
+		if (lockedId && itemId) { return lockedId === itemId; }
+		return !!lock.camera_name && item.camera_name === lock.camera_name;
+	};
+
+	const toggleCameraLock = () => {
+		if (config.cameraLock) {
+			config.cameraLock = null;
+			ElMessage.success("已解除采集设备锁定");
+			return;
+		}
+		const item = (cameraList.value as any[]).find(cam => String(cam.capture_index) === String(config.camera));
+		if (!item) {
+			ElMessage.warning("请先选择一个采集设备再锁定");
+			return;
+		}
+		config.cameraLock = { device_id: item.device_id || '', camera_name: item.camera_name || '' };
+		ElMessage.success(`已锁定采集设备「${item.camera_name}」，插拔摄像头后仍使用该设备`);
+	};
+
 	const refreshCameraList = ()=>{
 		cameraListLoading.value = true;
 		// 因为不确定之前摄像头是否还可用，强制设为-1
@@ -254,17 +300,32 @@
 			cameraList.value.length = 0;
 
 			// 添加列表
-			result.data.forEach(item => {
-				if(config.camera == "-1"){
-					config.camera = item.capture_index;
-				}
+			(result.data || []).forEach(item => {
 				cameraList.value.push(item);
 			});
+
+			// 已锁定设备：按设备路径找回它当前枚举到的索引，杜绝索引漂移后指向别的摄像头
+			const lock = config.cameraLock;
+			if (lock) {
+				const matched = (cameraList.value as any[]).find(item => isSameCameraLock(item, lock));
+				if (matched) {
+					config.camera = matched.capture_index;
+					config.cameraLock = { device_id: lock.device_id || matched.device_id || '', camera_name: matched.camera_name || lock.camera_name || '' };
+				} else {
+					ElMessage.warning(`锁定的采集设备「${lock.camera_name || lock.device_id}」当前未接入，解锁前不会改用其它摄像头`);
+				}
+			}
+
+			// 未锁定时沿用原逻辑：默认选中第一个设备
+			if (config.camera == "-1" && !config.cameraLock && cameraList.value.length > 0) {
+				config.camera = cameraList.value[0].capture_index;
+			}
 
 			// 立即添加到数据库，不能等用户点
 			return optionsStore.saveOptions({
 				cameraList: JSON.stringify(cameraList.value),
-				camera: config.camera
+				camera: config.camera,
+				cameraLock: config.cameraLock ? JSON.stringify(config.cameraLock) : ""
 			});
 		}).then(()=>{
 			ElMessage.success("获取摄像头列表成功");
@@ -374,6 +435,7 @@
 
 		optionsStore.saveOptions({
 			camera: config.camera,
+			cameraLock: config.cameraLock ? JSON.stringify(config.cameraLock) : "",
 			cameraRotation: String(config.cameraRotation),
 			unlockBrightness: String(config.unlockBrightness),
 			faceRecogDelay: config.faceRecogDelay,
@@ -734,9 +796,19 @@
 											:loading="cameraListLoading"
 											@click="refreshCameraList"
 										/>
+										<el-button
+											:icon="Lock"
+											:type="config.cameraLock ? 'warning' : 'default'"
+											class="refresh-camera-btn"
+											:title="config.cameraLock ? '已锁定当前设备，点击解除锁定' : '锁定当前设备：插拔或增减摄像头后仍使用这台设备'"
+											@click="toggleCameraLock"
+										/>
 									</div>
-									<p class="row-help">
-										保存后会在下一次启动识别时应用；指定设备无法输出画面时，会临时尝试列表中标记可用的其他设备。
+									<p class="row-help" v-if="config.cameraLock">
+										已锁定「{{ config.cameraLock.camera_name || config.cameraLock.device_id }}」：识别时按设备本身（而非列表序号）打开，插拔或增减摄像头都不会切到别的设备；锁定设备未接入时不会回退到其它摄像头。保存后生效。
+									</p>
+									<p class="row-help" v-else>
+										保存后会在下一次启动识别时应用；指定设备无法输出画面时，会临时尝试列表中标记可用的其他设备。点右侧锁形按钮可锁定当前设备，避免插拔摄像头后自动切换到别的设备。
 									</p>
 								</el-form-item>
 								<el-form-item label="摄像头旋转">

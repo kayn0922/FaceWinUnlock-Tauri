@@ -91,6 +91,27 @@ invoke('get_install_dir').then((res)=>{
       });
       if (firstValid) { info(`自动检测并选择摄像头: ${firstValid.camera_name} (${firstValid.capture_index})`); }
     } catch (error) { warn(formatObjectString("自动检测摄像头失败：", error)); }
+  } else if (optionsStore.getOptionValueByKey('cameraLock')) {
+    // 采集设备已锁定：按设备路径重新校准索引。Windows 枚举顺序会因插拔/增减摄像头变化，
+    // 直接沿用旧索引会悄悄换成另一台摄像头，这里每次启动都重算一次。
+    try {
+      const lock = JSON.parse(optionsStore.getOptionValueByKey('cameraLock'));
+      const result = await invoke("get_camera");
+      const cameraList = Array.isArray(result.data) ? result.data : [];
+      const lockedId = String(lock?.device_id || '').toLowerCase();
+      const matched = lockedId
+        ? cameraList.find(item => String(item.device_id || '').toLowerCase() === lockedId)
+        : cameraList.find(item => !!lock?.camera_name && item.camera_name === lock.camera_name);
+      await optionsStore.saveOptions({ cameraList: JSON.stringify(cameraList) });
+      if (matched) {
+        if (String(optionsStore.getOptionValueByKey('camera')) !== String(matched.capture_index)) {
+          await optionsStore.saveOptions({ camera: matched.capture_index });
+          info(`锁定采集设备已重新对应到索引 ${matched.capture_index}（${matched.camera_name}）`);
+        }
+      } else {
+        warn(`锁定的采集设备当前未接入：${lock?.camera_name || lock?.device_id || ''}，本次不会改用其它摄像头`);
+      }
+    } catch (error) { warn(formatObjectString("校准锁定采集设备失败：", error)); }
   }
 }).then(()=>{
   return invoke("init_model");

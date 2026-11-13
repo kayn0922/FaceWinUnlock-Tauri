@@ -43,6 +43,9 @@ struct ValidCameraInfo {
     camera_name: String,
     capture_index: String,
     is_valid: bool,
+    // Media Foundation 设备 symbolic link（如 \\?\usb#vid_xxxx&pid_xxxx#...#{guid}）。
+    // 与枚举顺序无关，前端用它锁定「默认采集设备」，避免插拔摄像头后索引漂移换设备。
+    device_id: String,
 }
 
 // 定义摄像头后端类型枚举
@@ -188,12 +191,13 @@ pub fn get_camera() -> Result<CustomResult, CustomResult> {
         Ok(devices) => {
             let valid_cameras: Vec<ValidCameraInfo> = devices
                 .into_iter()
-                .map(|(name, index)| {
+                .map(|(name, index, device_id)| {
                     let is_valid = is_camera_index_valid(index).unwrap_or(false);
                     ValidCameraInfo {
                         camera_name: name,
                         capture_index: index.to_string(),
                         is_valid,
+                        device_id,
                     }
                 })
                 .collect();
@@ -1187,7 +1191,7 @@ fn try_open_camera_with_backend(
 // open_camera 打开的设备）——修复复原版只显示占位名「Camera N」导致多摄像头/多虚拟摄像头机器上
 // 用户分不清、选错摄像头（选到 NVIDIA Broadcast/OBS 等虚拟摄像头出黑帧 → 无法录入/解锁）的问题
 // （issue #17）。MF 枚举失败时回退到逐索引探测的占位名，保证不比原实现差。
-fn get_windows_video_devices() -> windows::core::Result<Vec<(String, u32)>> {
+fn get_windows_video_devices() -> windows::core::Result<Vec<(String, u32, String)>> {
     match enumerate_video_devices_mf() {
         Ok(list) if !list.is_empty() => Ok(list),
         _ => {
@@ -1195,7 +1199,7 @@ fn get_windows_video_devices() -> windows::core::Result<Vec<(String, u32)>> {
             let mut devices = Vec::new();
             for index in 0u32..8 {
                 if is_camera_index_valid(index).unwrap_or(false) {
-                    devices.push((format!("摄像头 {}", index), index));
+                    devices.push((format!("摄像头 {}", index), index, String::new()));
                 }
             }
             Ok(devices)
@@ -1204,12 +1208,13 @@ fn get_windows_video_devices() -> windows::core::Result<Vec<(String, u32)>> {
 }
 
 // Media Foundation 视频设备友好名枚举。
-fn enumerate_video_devices_mf() -> windows::core::Result<Vec<(String, u32)>> {
+fn enumerate_video_devices_mf() -> windows::core::Result<Vec<(String, u32, String)>> {
     use windows::core::PWSTR;
     use windows::Win32::Media::MediaFoundation::{
         MFCreateAttributes, MFEnumDeviceSources, MFShutdown, MFStartup, IMFActivate, IMFAttributes,
         MFSTARTUP_LITE, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID, MF_VERSION,
+        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED,
@@ -1220,7 +1225,7 @@ fn enumerate_video_devices_mf() -> windows::core::Result<Vec<(String, u32)>> {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
 
-        let result = (|| -> windows::core::Result<Vec<(String, u32)>> {
+        let result = (|| -> windows::core::Result<Vec<(String, u32, String)>> {
             let mut attributes: Option<IMFAttributes> = None;
             MFCreateAttributes(&mut attributes, 1)?;
             let attributes = attributes.ok_or_else(windows::core::Error::empty)?;
@@ -1259,7 +1264,25 @@ fn enumerate_video_devices_mf() -> windows::core::Result<Vec<(String, u32)>> {
                         } else {
                             format!("摄像头 {}", i)
                         };
-                        list.push((name, i as u32));
+                        // 设备 symbolic link：锁定采集设备用的稳定标识（同型号多摄像头也能区分）。
+                        let mut id_ptr = PWSTR::null();
+                        let mut id_len: u32 = 0;
+                        let device_id = if dev
+                            .GetAllocatedString(
+                                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+                                &mut id_ptr,
+                                &mut id_len,
+                            )
+                            .is_ok()
+                            && !id_ptr.is_null()
+                        {
+                            let s = id_ptr.to_string().unwrap_or_default();
+                            CoTaskMemFree(Some(id_ptr.0 as *const _));
+                            s
+                        } else {
+                            String::new()
+                        };
+                        list.push((name, i as u32, device_id));
                     }
                 }
                 CoTaskMemFree(Some(devices_ptr as *const _));
@@ -1279,8 +1302,8 @@ mod camera_enum_tests {
     fn print_real_camera_names() {
         let devices = get_windows_video_devices().unwrap_or_default();
         println!("MF 枚举到 {} 个摄像头设备:", devices.len());
-        for (name, idx) in &devices {
-            println!("  索引 {} => {}", idx, name);
+        for (name, idx, device_id) in &devices {
+            println!("  索引 {} => {} | {}", idx, name, device_id);
         }
     }
 }

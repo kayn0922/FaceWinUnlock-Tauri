@@ -39,33 +39,24 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Require release signing configuration
+      - name: Check release signing configuration
         shell: pwsh
         env:
           UPDATE_RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_RELEASE_SIGNING_PRIVATE_KEY }}
           UPDATE_RELEASE_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.UPDATE_RELEASE_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          # 本 fork 不持有上游的 Minisign 发布密钥：secret 缺失时自动降级为「只构建未签名产物」，
+          # 跳过 update manifest 签名与 SHA256SUMS 签名，直接发布安装包供自用。
           $ErrorActionPreference = "Stop"
           $keyFile = "UI/src-tauri/release-signing-public-keys.txt"
-          if (-not (Test-Path $keyFile)) { throw "Pinned release public-key file is missing" }
-          $publicKeys = @(Get-Content -LiteralPath $keyFile | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-          if ($publicKeys.Count -eq 0 -or $publicKeys -contains "UNCONFIGURED") {
-            throw "Configure a Minisign public key in $keyFile before releasing"
+          $hasKey = $env:UPDATE_RELEASE_SIGNING_PRIVATE_KEY -and $env:UPDATE_RELEASE_SIGNING_PRIVATE_KEY_PASSWORD
+          $hasPinned = (Test-Path $keyFile) -and ((Get-Content -LiteralPath $keyFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne "UNCONFIGURED" }) | Measure-Object).Count -gt 0
+          if ($hasKey -and $hasPinned) {
+            Write-Host "Release signing configuration is present."
+          } else {
+            "FORK_UNSIGNED=1" >> $env:GITHUB_ENV
+            Write-Host "::warning::Release signing secrets are missing - this run produces unsigned artifacts only."
           }
-          foreach ($publicKey in $publicKeys) {
-            try { $decoded = [Convert]::FromBase64String($publicKey) }
-            catch { throw "Pinned release public key is not valid base64" }
-            if ($decoded.Length -ne 42 -or [Text.Encoding]::ASCII.GetString($decoded, 0, 2) -ne "Ed") {
-              throw "Pinned key must be a Minisign Ed25519 public key"
-            }
-          }
-          if (-not $env:UPDATE_RELEASE_SIGNING_PRIVATE_KEY) {
-            throw "Secret UPDATE_RELEASE_SIGNING_PRIVATE_KEY is required"
-          }
-          if (-not $env:UPDATE_RELEASE_SIGNING_PRIVATE_KEY_PASSWORD) {
-            throw "Secret UPDATE_RELEASE_SIGNING_PRIVATE_KEY_PASSWORD is required"
-          }
-          Write-Host "Release signing configuration is present."
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -140,7 +131,7 @@ jobs:
             throw "OPENCV_PREBUILT_TAG is empty — run scripts/build_opencv_prebuilt.ps1 locally first and set the tag"
           }
           # 获取 release 信息（不依赖 gh CLI，直接用 GitHub API）
-          $repo = "${{ github.repository }}"
+          $repo = "starnotes-xj/FaceWinUnlock-Tauri"  # fork 没有该 Release 资产，统一从上游仓库下载预构建 OpenCV
           $url = "https://api.github.com/repos/$repo/releases/tags/$tag"
           Write-Host "Fetching release info from: $url"
           $release = Invoke-RestMethod -Uri $url -Headers @{
@@ -576,6 +567,8 @@ jobs:
           Get-Content $out
 
       - name: Sign release metadata and generate SHA256SUMS
+
+        if: env.FORK_UNSIGNED != '1'
         working-directory: UI
         shell: pwsh
         env:
@@ -652,7 +645,7 @@ jobs:
           draft: false
           prerelease: ${{ steps.release_meta.outputs.is_prerelease }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           files: |
             target/release/FaceWinUnlock_Tauri.dll
             target/release/FaceWinUnlock-Server.exe

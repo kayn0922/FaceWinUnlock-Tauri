@@ -1458,6 +1458,198 @@ fn configured_camera_index(db_path: &Path) -> i32 {
     load_camera_index(db_path).unwrap_or(0)
 }
 
+// ===== 采集设备锁定（camera lock）=====
+// Windows 下 OpenCV 的摄像头索引来自系统枚举顺序：插拔任意一台摄像头都可能让同一台物理设备的
+// 索引漂移，用户保存的「默认采集设备」就会悄悄指向另一台摄像头（拔掉内置摄像头后打开外置等）。
+// 这里改为锁定设备的 Media Foundation symbolic link（设备路径，与枚举顺序无关），
+// 每次打开前重新枚举当前顺序并按 symbolic link 解析出索引，因此增减摄像头不会更换采集设备。
+// 锁定设备不在场时宁可不打开摄像头，也不回退到其它设备。
+
+#[derive(Debug, Clone, Default)]
+struct LockedCamera {
+    device_id: String,
+    camera_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct CameraDeviceEntry {
+    device_id: String,
+    camera_name: String,
+    index: i32,
+}
+
+impl LockedCamera {
+    fn label(&self) -> String {
+        if !self.camera_name.trim().is_empty() {
+            self.camera_name.clone()
+        } else {
+            self.device_id.clone()
+        }
+    }
+}
+
+/// 读取 `cameraLock` 选项。支持 JSON 对象 {"device_id":"...","camera_name":"..."} 与纯字符串
+/// （视为 device_id）；空串 / `null` / `{}` 表示未锁定，沿用旧的按索引选择行为。
+fn load_locked_camera(db_path: &Path) -> Option<LockedCamera> {
+    let raw = load_option_value(db_path, "cameraLock")?;
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "null" || raw == "{}" {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => {
+            let device_id = map
+                .get("device_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let camera_name = map
+                .get("camera_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if device_id.is_empty() && camera_name.is_empty() {
+                return None;
+            }
+            Some(LockedCamera {
+                device_id,
+                camera_name,
+            })
+        }
+        Ok(serde_json::Value::String(value)) => {
+            let device_id = value.trim().to_string();
+            if device_id.is_empty() {
+                return None;
+            }
+            Some(LockedCamera {
+                device_id,
+                camera_name: String::new(),
+            })
+        }
+        Ok(_) => None,
+        Err(_) => Some(LockedCamera {
+            device_id: raw.to_string(),
+            camera_name: String::new(),
+        }),
+    }
+}
+
+/// 按 Media Foundation 枚举顺序列出视频采集设备。该顺序与 OpenCV 的 MSMF 后端一致，
+/// 也是 UI 端 `get_camera` 生成 capture_index 的顺序，因此解析出的索引可直接用于打开。
+fn enumerate_camera_devices() -> Vec<CameraDeviceEntry> {
+    use windows::core::PWSTR;
+    use windows::Win32::Media::MediaFoundation::{
+        MFCreateAttributes, MFEnumDeviceSources, MFShutdown, MFStartup, IMFActivate, IMFAttributes,
+        MFSTARTUP_LITE, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_VERSION,
+    };
+    use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+
+    let mut entries = Vec::new();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if MFStartup(MF_VERSION, MFSTARTUP_LITE).is_err() {
+            return entries;
+        }
+
+        let collected = (|| -> windows::core::Result<Vec<CameraDeviceEntry>> {
+            let mut attributes: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut attributes, 1)?;
+            let attributes = attributes.ok_or_else(windows::core::Error::empty)?;
+            attributes.SetGUID(
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+            )?;
+
+            let mut devices_ptr: *mut Option<IMFActivate> = std::ptr::null_mut();
+            let mut count: u32 = 0;
+            MFEnumDeviceSources(&attributes, &mut devices_ptr, &mut count)?;
+
+            let mut list = Vec::new();
+            if !devices_ptr.is_null() {
+                let devices = std::slice::from_raw_parts(devices_ptr, count as usize);
+                for (i, device) in devices.iter().enumerate() {
+                    let Some(device) = device else { continue };
+                    let read_attribute = |key: &windows::core::GUID| -> String {
+                        unsafe {
+                            let mut value_ptr = PWSTR::null();
+                            let mut value_len: u32 = 0;
+                            if device
+                                .GetAllocatedString(key, &mut value_ptr, &mut value_len)
+                                .is_ok()
+                                && !value_ptr.is_null()
+                            {
+                                let text = value_ptr.to_string().unwrap_or_default();
+                                CoTaskMemFree(Some(value_ptr.0 as *const _));
+                                text
+                            } else {
+                                String::new()
+                            }
+                        }
+                    };
+
+                    let mut camera_name = read_attribute(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+                    if camera_name.trim().is_empty() {
+                        camera_name = format!("摄像头 {}", i);
+                    }
+                    let device_id =
+                        read_attribute(&MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK);
+                    list.push(CameraDeviceEntry {
+                        device_id,
+                        camera_name,
+                        index: i as i32,
+                    });
+                }
+                CoTaskMemFree(Some(devices_ptr as *const _));
+            }
+            Ok(list)
+        })();
+
+        let _ = MFShutdown();
+        if let Ok(list) = collected {
+            entries = list;
+        }
+    }
+    entries
+}
+
+/// 在本次枚举结果中定位锁定设备当前对应的索引。
+/// 优先按 symbolic link 精确匹配；驱动升级/换口导致尾部实例路径微调时退化为大小写不敏感的包含匹配；
+/// 旧配置没有 device_id 时按设备友好名匹配。
+fn resolve_locked_camera_index(
+    lock: &LockedCamera,
+    devices: &[CameraDeviceEntry],
+) -> Option<i32> {
+    let locked_id = lock.device_id.trim();
+    if !locked_id.is_empty() {
+        if let Some(hit) = devices
+            .iter()
+            .find(|device| device.device_id.eq_ignore_ascii_case(locked_id))
+        {
+            return Some(hit.index);
+        }
+        let needle = locked_id.to_ascii_lowercase();
+        if let Some(hit) = devices.iter().find(|device| {
+            let candidate = device.device_id.to_ascii_lowercase();
+            !candidate.is_empty() && (candidate.contains(&needle) || needle.contains(&candidate))
+        }) {
+            return Some(hit.index);
+        }
+    }
+    if !lock.camera_name.trim().is_empty() {
+        if let Some(hit) = devices
+            .iter()
+            .find(|device| device.camera_name == lock.camera_name)
+        {
+            return Some(hit.index);
+        }
+    }
+    None
+}
+
 fn update_camera_index(current_index: &mut i32, selected_index: i32) -> Option<i32> {
     if *current_index == selected_index {
         return None;
@@ -1597,10 +1789,62 @@ fn open_camera_with_fallback(
     exe_dir: &Path,
     should_cancel: impl Fn() -> bool,
 ) -> Option<(VideoCapture, &'static str, i32)> {
+    // 锁定设备时先用 symbolic link 把「当前枚举顺序」解析成索引，抵消插拔摄像头造成的索引漂移；
+    // 锁定设备不在场时直接放弃本次打开，绝不回退到其它摄像头。
+    let locked = load_locked_camera(db_path);
+    let (configured_index, lock_active) = match &locked {
+        Some(lock) => {
+            let devices = enumerate_camera_devices();
+            match resolve_locked_camera_index(lock, &devices) {
+                Some(index) => {
+                    if index != configured_index {
+                        log_service(
+                            exe_dir,
+                            "INFO",
+                            &format!(
+                                "locked camera '{}' resolved to index {} (saved index {})",
+                                lock.label(),
+                                index,
+                                configured_index
+                            ),
+                        );
+                    }
+                    (index, true)
+                }
+                None => {
+                    log_service(
+                        exe_dir,
+                        "WARN",
+                        &format!(
+                            "locked camera '{}' is not connected ({} device(s) enumerated); skip opening other cameras",
+                            lock.label(),
+                            devices.len()
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        None => (configured_index, false),
+    };
+
     if let Some((camera, backend)) =
         open_configured_camera(configured_index, exe_dir, &should_cancel)
     {
         return Some((camera, backend, configured_index));
+    }
+
+    if lock_active {
+        // 锁定模式禁止自动回退到其它设备：宁可本次不识别，也不换设备。
+        log_service(
+            exe_dir,
+            "WARN",
+            &format!(
+                "locked camera index {} produced no usable frames; fallback disabled in lock mode",
+                configured_index
+            ),
+        );
+        return None;
     }
 
     for fallback_index in load_camera_fallback_indices(db_path, configured_index) {
